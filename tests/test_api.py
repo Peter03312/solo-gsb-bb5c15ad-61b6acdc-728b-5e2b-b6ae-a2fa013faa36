@@ -651,5 +651,198 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(ids, ["a", "b", "c", "d"])
 
 
+class RetimeTests(unittest.TestCase):
+    def retime(self, cues, anchors):
+        return client.post(
+            "/retime", json={"cues": cues, "anchors": anchors}
+        )
+
+    SCALE = [{"source": 0, "target": 0}, {"source": 10, "target": 20}]
+
+    def test_linear_scale_within_segment(self):
+        # 单段斜率 2：2→4、4→8
+        resp = self.retime(
+            [cue("a", 2, 4, "hi", "alice")], self.SCALE
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "retimed")
+        self.assertEqual(data["count"], 1)
+        c = data["cues"][0]
+        self.assertEqual((c["start"], c["end"]), (4.0, 8.0))
+        # id、text、speaker 保持
+        self.assertEqual(c["id"], "a")
+        self.assertEqual(c["text"], "hi")
+        self.assertEqual(c["speaker"], "alice")
+
+    def test_anchor_position_maps_exactly_to_target(self):
+        # 精确命中锚点：source=10 直接映射 target=20
+        resp = self.retime([cue("a", 10, 10.5)], self.SCALE)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        c = resp.json()["cues"][0]
+        self.assertEqual((c["start"], c["end"]), (20.0, 21.0))
+
+    def test_cue_spanning_anchor_uses_independent_segments(self):
+        # 三段锚点：[0,10] 斜率 2，[10,30] 斜率 0.25
+        anchors = [
+            {"source": 0, "target": 0},
+            {"source": 10, "target": 20},
+            {"source": 30, "target": 25},
+        ]
+        # start=5 → 10；end=20 → 22.5，两端分别落在不同区间
+        resp = self.retime([cue("a", 5, 20)], anchors)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        c = resp.json()["cues"][0]
+        self.assertAlmostEqual(c["start"], 10.0)
+        self.assertAlmostEqual(c["end"], 22.5)
+
+    def test_extrapolation_beyond_last_anchor(self):
+        anchors = [
+            {"source": 10, "target": 20},
+            {"source": 30, "target": 25},
+        ]
+        # 沿末段外推：40 → 27.5
+        resp = self.retime([cue("a", 40, 44)], anchors)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        c = resp.json()["cues"][0]
+        self.assertAlmostEqual(c["start"], 27.5)
+        self.assertAlmostEqual(c["end"], 28.5)
+
+    def test_extrapolation_before_first_anchor_positive(self):
+        # 首段斜率 0.1：早于首锚点外推仍为正
+        anchors = [
+            {"source": 10, "target": 100},
+            {"source": 20, "target": 101},
+        ]
+        resp = self.retime([cue("a", 0, 5)], anchors)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        c = resp.json()["cues"][0]
+        self.assertAlmostEqual(c["start"], 99.0)
+        self.assertAlmostEqual(c["end"], 99.5)
+
+    def test_negative_mapped_time_returns_409_without_partial_output(self):
+        # 首段斜率 1：source=0 映射到 -10
+        anchors = [
+            {"source": 10, "target": 0},
+            {"source": 20, "target": 10},
+        ]
+        resp = self.retime([cue("a", 0, 5), cue("b", 12, 14)], anchors)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "retime_error")
+        self.assertEqual(data["cue_ids"], ["a"])
+        self.assertEqual(data["negative_times"], ["a"])
+        self.assertEqual(data["invalid_intervals"], [])
+        self.assertNotIn("cues", data)
+
+    def test_all_related_cue_ids_listed_in_input_order(self):
+        # 一组锚点同时触发两类问题：
+        #   a 起点沿首段外推为负；b 跨越锚点且两端映射结果因浮点舍入相等（end <= start）；
+        #   c 合法。409 须列出全部相关 cue id（输入顺序、去重），且不含任何 cue 结果。
+        anchors = [
+            {"source": 0.5, "target": 2.0},
+            {"source": 1.0, "target": 4.5},
+            {"source": 101.0, "target": 4.5001},
+        ]
+        resp = self.retime(
+            [
+                cue("a", 0, 0.25),  # -0.5、0.75：起点为负
+                cue("b", 0.9999999999999999, 1.0000000000000002),  # 4.5、4.5
+                cue("c", 50, 60),  # 段内合法
+            ],
+            anchors,
+        )
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "retime_error")
+        self.assertEqual(data["cue_ids"], ["a", "b"])
+        self.assertEqual(data["negative_times"], ["a"])
+        self.assertEqual(data["invalid_intervals"], ["b"])
+        self.assertNotIn("cues", data)
+
+    def test_input_order_is_preserved_without_sorting(self):
+        # 输入故意不按时间排序；输出顺序与字段保持一致
+        resp = self.retime(
+            [
+                cue("late", 8, 9, "L"),
+                cue("early", 1, 2, "E"),
+                cue("mid", 4, 5, "M", "bob"),
+            ],
+            self.SCALE,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cues = resp.json()["cues"]
+        self.assertEqual([c["id"] for c in cues], ["late", "early", "mid"])
+        self.assertEqual([c["text"] for c in cues], ["L", "E", "M"])
+        self.assertEqual(cues[2]["speaker"], "bob")
+        self.assertEqual(
+            [(c["start"], c["end"]) for c in cues],
+            [(16.0, 18.0), (2.0, 4.0), (8.0, 10.0)],
+        )
+
+    def test_empty_cues_returns_empty_list(self):
+        resp = self.retime([], self.SCALE)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["cues"], [])
+        self.assertEqual(data["count"], 0)
+
+    def test_two_anchors_support_interpolate_and_extrapolate(self):
+        anchors = [
+            {"source": 0, "target": 100},
+            {"source": 10, "target": 110},
+        ]
+        # 0 → 100（命中锚点）、20 → 120（沿唯一区间向后外推）
+        resp = self.retime([cue("a", 0, 20)], anchors)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        c = resp.json()["cues"][0]
+        self.assertEqual((c["start"], c["end"]), (100.0, 120.0))
+
+    # —— 请求体校验：均为 422 ——
+
+    def test_single_anchor_rejected(self):
+        resp = self.retime([cue("a", 0, 1)], [{"source": 0, "target": 0}])
+        self.assertEqual(resp.status_code, 422)
+
+    def test_non_increasing_source_rejected(self):
+        resp = self.retime(
+            [cue("a", 0, 1)],
+            [{"source": 0, "target": 0}, {"source": 0, "target": 10}],
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_decreasing_source_rejected(self):
+        resp = self.retime(
+            [cue("a", 0, 1)],
+            [{"source": 10, "target": 0}, {"source": 5, "target": 10}],
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_non_increasing_target_rejected(self):
+        resp = self.retime(
+            [cue("a", 0, 1)],
+            [{"source": 0, "target": 10}, {"source": 10, "target": 10}],
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_negative_anchor_rejected(self):
+        resp = self.retime(
+            [cue("a", 0, 1)],
+            [{"source": -1, "target": 0}, {"source": 10, "target": 10}],
+        )
+        self.assertEqual(resp.status_code, 422)
+        resp = self.retime(
+            [cue("a", 0, 1)],
+            [{"source": 0, "target": -1}, {"source": 10, "target": 10}],
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_duplicate_cue_ids_rejected(self):
+        resp = self.retime(
+            [cue("a", 0, 1), cue("a", 2, 3)], self.SCALE
+        )
+        self.assertEqual(resp.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

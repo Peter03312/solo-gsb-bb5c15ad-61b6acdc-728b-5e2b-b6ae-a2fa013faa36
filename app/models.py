@@ -194,6 +194,62 @@ class ResolveSuccessResponse(BaseModel):
     count: int
 
 
+class Anchor(BaseModel):
+    """源/目标时间锚点对：source 时刻映射到 target 时刻（单位：秒）。"""
+
+    source: float = Field(..., ge=0, description="源时间轴锚点（秒），非负")
+    target: float = Field(..., ge=0, description="目标时间轴锚点（秒），非负")
+
+
+class RetimeRequest(BaseModel):
+    """POST /retime 的请求体：cue 列表与至少两个 source/target 时间锚点。"""
+
+    cues: list[Cue] = Field(default_factory=list, description="待校时的 cue 列表，顺序保持不变")
+    anchors: list[Anchor] = Field(
+        ...,
+        min_length=2,
+        description="至少两个时间锚点；source、target 两列均须严格递增",
+    )
+
+    @model_validator(mode="after")
+    def _check_anchors_and_ids(self) -> "RetimeRequest":
+        sources = [a.source for a in self.anchors]
+        targets = [a.target for a in self.anchors]
+        if any(b <= a for a, b in zip(sources, sources[1:])):
+            raise ValueError("anchors 的 source 必须严格递增")
+        if any(b <= a for a, b in zip(targets, targets[1:])):
+            raise ValueError("anchors 的 target 必须严格递增")
+        ids = [cue.id for cue in self.cues]
+        if len(ids) != len(set(ids)):
+            duplicated = sorted({cue_id for cue_id in ids if ids.count(cue_id) > 1})
+            raise ValueError(f"cues 中存在重复的 cue id: {', '.join(duplicated)}")
+        return self
+
+
+class RetimeSuccessResponse(BaseModel):
+    """校时成功：结果顺序与输入 cues 完全一致。"""
+
+    status: Literal["retimed"] = "retimed"
+    cues: list[Cue]
+    count: int
+
+
+class RetimeErrorResponse(BaseModel):
+    """映射后存在负时间或非法区间时的 409 响应：不输出部分结果。"""
+
+    status: Literal["retime_error"] = "retime_error"
+    cue_ids: list[str] = Field(
+        ...,
+        description="全部相关 cue id（映射时间为负或 end <= start），按输入顺序去重",
+    )
+    negative_times: list[str] = Field(
+        default_factory=list, description="任一映射时间为负的 cue id"
+    )
+    invalid_intervals: list[str] = Field(
+        default_factory=list, description="映射后 end <= start 的 cue id"
+    )
+
+
 class HealthResponse(BaseModel):
     """健康检查响应。"""
 

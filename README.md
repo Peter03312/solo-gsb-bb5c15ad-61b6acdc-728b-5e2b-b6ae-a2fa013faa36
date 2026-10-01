@@ -1,9 +1,10 @@
-# 字幕时间轴三方合并 API
+# 字幕时间轴三方合并 / 锚点校时 API
 
 供字幕团队合并时间轴修订的 HTTP 服务。接收同一条时间轴的三个版本——
 `base`（共同祖先）、`current`（我方修订）、`incoming`（对方修订）——
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 `POST /resolve` 进一步支持对识别出的冲突提交人工决策，输出解决后的时间轴。
+`POST /retime` 按 source/target 时间锚点对 cue 的 start、end 做分段线性校时。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -222,6 +223,101 @@ curl -X POST http://localhost:8000/resolve \
 {"status":"resolved","cues":[{"id":"a","start":1.0,"end":9.0,"text":"keep","speaker":null}],"count":1}
 ```
 
+### POST /retime
+
+按 source/target 时间锚点对 cue 做分段线性校时（重新映射时间轴）。
+
+请求体：
+
+| 字段      | 类型     | 说明                                       |
+| --------- | -------- | ------------------------------------------ |
+| `cues`    | Cue[]    | 待校时的 cue 列表（可空），字段规则同 `/merge` |
+| `anchors` | Anchor[] | **至少两个** source/target 锚点对          |
+
+Anchor 结构（时间单位为秒，支持小数）：
+
+```json
+{"source": 10.0, "target": 12.5}
+```
+
+锚点校验（任一不过返回 `422`）：
+
+- 至少两个锚点；
+- `source` 列与 `target` 列的每个值均须非负；
+- 两列都必须**严格递增**（相等或递减均不合法）；
+- `cues` 中不允许重复 id。
+
+校时规则：
+
+1. 对每条 cue 的 `start`、`end` **分别**做一维分段线性映射；
+2. 时间点落在某两个相邻锚点之间时，按该区间线性插值；精确落在锚点上时直接取对应 `target`；
+3. 早于首个锚点 / 晚于末个锚点时，沿首段 / 末段的斜率**外推**；
+4. cue 两端可能落在不同区间（跨越锚点），各自独立计算、互不影响；
+5. `id`、`text`、`speaker` 原样保留；输出顺序与输入 `cues` 完全一致（**不排序**）。
+
+统一校验（先于输出，任一不过返回 `409`、**不输出部分结果**）：
+
+- 某条 cue 的任一映射时间为负（仅可能出现在沿首段向更早时间外推时）；
+- 映射后区间非法（`end <= start`）；
+- 409 响应在 `cue_ids` 中按输入顺序去重列出**全部**相关 cue id，
+  并通过 `negative_times` / `invalid_intervals` 给出分类。
+
+#### 调用样例
+
+```bash
+curl -X POST http://localhost:8000/retime \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id": "a", "start": 0,  "end": 2,  "text": "你好", "speaker": null},
+      {"id": "b", "start": 15, "end": 18, "text": "世界", "speaker": "narrator"}
+    ],
+    "anchors": [
+      {"source": 0,  "target": 0},
+      {"source": 10, "target": 20},
+      {"source": 20, "target": 25}
+    ]
+  }'
+```
+
+`a` 位于首段（斜率 2）：0 → 0、2 → 4；`b` 跨越末两个锚点，15 落在段内插值 → 22.5，
+18 → 24.0；顺序、文本与说话人保持：
+
+```json
+{
+  "status": "retimed",
+  "cues": [
+    {"id": "a", "start": 0.0,  "end": 4.0,  "text": "你好", "speaker": null},
+    {"id": "b", "start": 22.5, "end": 24.0, "text": "世界", "speaker": "narrator"}
+  ],
+  "count": 2
+}
+```
+
+向更早时间外推产生负时间时返回 `409`（下例 0、2 沿 [10,20]→[0,10] 外推为 -10、-8）：
+
+```bash
+curl -X POST http://localhost:8000/retime \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [{"id": "a", "start": 0, "end": 2, "text": "hi"}],
+    "anchors": [{"source": 10, "target": 0}, {"source": 20, "target": 10}]
+  }'
+```
+
+```json
+{
+  "status": "retime_error",
+  "cue_ids": ["a"],
+  "negative_times": ["a"],
+  "invalid_intervals": []
+}
+```
+
+- `200 status=retimed`：`{"status":"retimed","cues":[…],"count":N}`；
+- `409 status=retime_error`：存在负映射时间或非法区间，不返回校时结果；
+- `422`：请求体校验失败（锚点不足两个、任一列非严格递增、负值、重复 id、`end <= start` 等）。
+
 ## 快速试用
 
 ```bash
@@ -246,11 +342,12 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
+│   ├── retime.py     # 锚点分段线性映射/外推纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 46 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 62 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -17,7 +17,11 @@ from .models import (
     ResolveRequest,
     ResolveSuccessResponse,
     ResolveTimelineErrorResponse,
+    RetimeErrorResponse,
+    RetimeRequest,
+    RetimeSuccessResponse,
 )
+from .retime import retime_cues
 
 app = FastAPI(
     title="字幕时间轴三方合并 API",
@@ -25,7 +29,8 @@ app = FastAPI(
         "POST /merge 接收 base / current / incoming 三版 cue 列表，"
         "按 cue id 进行三方合并、字段级冲突检测与时间轴重叠检测；"
         "POST /resolve 在同一三方合并之上应用人工冲突决策，"
-        "输出解决后的时间轴。"
+        "输出解决后的时间轴；"
+        "POST /retime 按 source/target 时间锚点对 cue 做分段线性校时。"
     ),
     version=__version__,
 )
@@ -128,3 +133,33 @@ def resolve(request: ResolveRequest):
         return JSONResponse(status_code=409, content=content)
 
     return ResolveSuccessResponse(cues=result.resolved, count=len(result.resolved))
+
+
+@app.post(
+    "/retime",
+    tags=["retime"],
+    response_model=RetimeSuccessResponse,
+    responses={
+        409: {
+            "model": RetimeErrorResponse,
+            "description": (
+                "存在 cue 的映射时间为负或映射后区间非法（end <= start），"
+                "列出全部相关 cue id，不输出部分结果。"
+            ),
+        },
+    },
+)
+def retime(request: RetimeRequest):
+    """按 source/target 锚点对 cue 的 start、end 分段线性校时。"""
+    result = retime_cues(request.cues, request.anchors)
+
+    if result.cue_ids:
+        content = RetimeErrorResponse(
+            cue_ids=result.cue_ids,
+            negative_times=result.negative_times,
+            invalid_intervals=result.invalid_intervals,
+        ).model_dump()
+        return JSONResponse(status_code=409, content=content)
+
+    # 保持输入顺序：retimed 按请求中的 cue 顺序逐条生成，不做排序
+    return RetimeSuccessResponse(cues=result.retimed, count=len(result.retimed))
